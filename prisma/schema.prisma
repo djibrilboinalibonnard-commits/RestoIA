@@ -1,0 +1,596 @@
+// VoxEmploy — schéma de données complet (Phase 1)
+// Convention : toutes les tables « métier » portent organizationId et sont
+// accessibles uniquement via la couche repository (TenantContext obligatoire).
+
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth & tenants (tables gérées par Better Auth + extensions VoxEmploy)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions    Session[]
+  accounts    Account[]
+  memberships Member[]
+  invitations Invitation[]
+  auditLogs   AuditLog[]
+
+  @@map("user")
+}
+
+model Session {
+  id                   String   @id @default(cuid())
+  userId               String
+  token                String   @unique
+  expiresAt            DateTime
+  ipAddress            String?
+  userAgent            String?
+  activeOrganizationId String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  logo      String?
+  metadata  String?
+  createdAt DateTime @default(now())
+
+  // Extensions VoxEmploy (Better Auth ignore ces colonnes)
+  retentionDays Int @default(90) // rétention RGPD audio/transcriptions
+
+  members      Member[]
+  invitations  Invitation[]
+  businesses   Business[]
+  assistants   Assistant[]
+  phoneNumbers PhoneNumber[]
+  calls        Call[]
+  bookings     Booking[]
+  orders       Order[]
+  messages     Message[]
+  subscription Subscription?
+  usageRecords UsageRecord[]
+  auditLogs    AuditLog[]
+
+  @@map("organization")
+}
+
+model Member {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  role           String   @default("member") // owner | staff (member = staff)
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("member")
+}
+
+model Invitation {
+  id             String   @id @default(cuid())
+  email          String
+  inviterId      String
+  organizationId String
+  role           String   @default("member")
+  status         String   @default("pending")
+  expiresAt      DateTime
+
+  inviter      User         @relation(fields: [inviterId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([email])
+  @@map("invitation")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commerce & agent vocal
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Business {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  addressLine1   String?
+  addressLine2   String?
+  postalCode     String?
+  city           String?
+  country        String  @default("FR")
+  contactPhone   String? // ligne existante du commerce (renvoi d'appel)
+  timezone       String  @default("Europe/Paris")
+  /// Horaires d'ouverture par jour : { "mon": [{"open":"12:00","close":"14:30"}], ... }
+  openingHours   Json?
+  /// FAQ libre : [{"q":"Avez-vous un parking ?","a":"Oui, 20 places."}]
+  faq            Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assistant         Assistant?
+  phoneNumbers      PhoneNumber[]
+  capacityRules     CapacityRule[]
+  capacityOverrides CapacityOverride[]
+  menus             Menu[]
+  calls             Call[]
+  bookings          Booking[]
+  orders            Order[]
+  messages          Message[]
+
+  @@index([organizationId])
+  @@map("business")
+}
+
+enum AssistantStatus {
+  DRAFT // en cours de configuration (onboarding)
+  READY // testé, prêt à être activé
+  LIVE // répond aux appels
+  PAUSED // suspendu (impayé, choix du client)
+}
+
+model Assistant {
+  id                  String          @id @default(cuid())
+  organizationId      String
+  businessId          String          @unique
+  displayName         String          @default("Léa") // nom que l'agent donne au téléphone
+  voiceId             String? // identifiant de voix chez le provider
+  /// Ton et personnalité configurés par le commerçant (injectés dans le prompt)
+  personality         String?
+  /// Consignes métier libres (ex. « pas de réservation >8 sans acompte »)
+  customInstructions  String?
+  promptVersion       String          @default("v1")
+  providerAssistantId String? // id de l'assistant chez Vapi
+  recordingEnabled    Boolean         @default(true)
+  status              AssistantStatus @default(DRAFT)
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("assistant")
+}
+
+enum PhoneNumberStatus {
+  PENDING
+  ACTIVE
+  RELEASED
+}
+
+model PhoneNumber {
+  id               String            @id @default(cuid())
+  organizationId   String
+  businessId       String
+  e164             String            @unique // +33XXXXXXXXX
+  provider         String            @default("twilio")
+  providerNumberId String? // SID Twilio
+  providerImportId String? // id du numéro importé chez Vapi
+  status           PhoneNumberStatus @default(PENDING)
+  createdAt        DateTime          @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  calls        Call[]
+
+  @@index([organizationId])
+  @@map("phone_number")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Appels
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum CallStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+enum CallOutcome {
+  BOOKING_CREATED
+  BOOKING_MODIFIED
+  BOOKING_CANCELLED
+  ORDER_CREATED
+  FAQ_ANSWERED
+  MESSAGE_TAKEN
+  TRANSFERRED
+  ABANDONED
+  ERROR
+}
+
+model Call {
+  id             String       @id @default(cuid())
+  organizationId String
+  businessId     String
+  phoneNumberId  String?
+  providerCallId String       @unique // id de l'appel chez Vapi
+  fromE164       String? // numéro appelant (null si masqué)
+  startedAt      DateTime
+  endedAt        DateTime?
+  durationSec    Int?
+  status         CallStatus   @default(IN_PROGRESS)
+  outcome        CallOutcome?
+  /// Intention principale extraite post-appel (reservation, commande, question, ...)
+  intent         String?
+  /// Transcription complète [{role, text, at}]
+  transcript     Json?
+  /// Résumé généré post-appel (Claude Opus 4.8)
+  summary        String?
+  /// Entités extraites post-appel : { date, heure, couverts, nom, ... }
+  entities       Json?
+  audioUrl       String? // S3 UE, purgé selon retentionDays
+
+  // Ledger de coûts (euros, précision 4 décimales)
+  costTelephony Decimal? @db.Decimal(10, 4)
+  costStt       Decimal? @db.Decimal(10, 4)
+  costLlm       Decimal? @db.Decimal(10, 4)
+  costTts       Decimal? @db.Decimal(10, 4)
+  costPlatform  Decimal? @db.Decimal(10, 4)
+  costTotal     Decimal? @db.Decimal(10, 4)
+
+  createdAt DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  phoneNumber  PhoneNumber? @relation(fields: [phoneNumberId], references: [id], onDelete: SetNull)
+  bookings     Booking[]
+  orders       Order[]
+  messages     Message[]
+
+  @@index([organizationId, startedAt])
+  @@index([businessId, startedAt])
+  @@map("call")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Réservations & capacité
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum BookingStatus {
+  CONFIRMED
+  MODIFIED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum BookingSource {
+  CALL
+  DASHBOARD
+}
+
+model Booking {
+  id             String        @id @default(cuid())
+  organizationId String
+  businessId     String
+  callId         String?
+  startsAt       DateTime // date + heure du créneau
+  covers         Int // nombre de couverts
+  customerName   String
+  customerPhone  String? // E.164
+  notes          String?
+  status         BookingStatus @default(CONFIRMED)
+  source         BookingSource @default(CALL)
+  cancelledAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  call         Call?        @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, startsAt])
+  @@index([businessId, startsAt])
+  @@index([customerPhone])
+  @@map("booking")
+}
+
+/// Capacité récurrente par jour de semaine et plage horaire.
+model CapacityRule {
+  id           String @id @default(cuid())
+  businessId   String
+  dayOfWeek    Int // 0 = dimanche ... 6 = samedi
+  startTime    String // "12:00"
+  endTime      String // "14:30"
+  slotMinutes  Int    @default(30)
+  maxCovers    Int // couverts max par créneau
+  maxPartySize Int    @default(8) // au-delà → escalade humaine
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, dayOfWeek])
+  @@map("capacity_rule")
+}
+
+/// Exception ponctuelle : fermeture, capacité réduite, événement.
+model CapacityOverride {
+  id         String   @id @default(cuid())
+  businessId String
+  date       DateTime @db.Date
+  closed     Boolean  @default(false)
+  maxCovers  Int? // remplace la capacité du jour si non fermé
+  reason     String?
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, date])
+  @@map("capacity_override")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Menu & commandes
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Menu {
+  id         String   @id @default(cuid())
+  businessId String
+  name       String   @default("Menu principal")
+  version    Int      @default(1)
+  active     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  business   Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  categories MenuCategory[]
+
+  @@index([businessId])
+  @@map("menu")
+}
+
+model MenuCategory {
+  id       String @id @default(cuid())
+  menuId   String
+  name     String
+  position Int    @default(0)
+
+  menu  Menu       @relation(fields: [menuId], references: [id], onDelete: Cascade)
+  items MenuItem[]
+
+  @@index([menuId])
+  @@map("menu_category")
+}
+
+model MenuItem {
+  id          String  @id @default(cuid())
+  categoryId  String
+  name        String
+  description String?
+  priceCents  Int
+  available   Boolean @default(true)
+  position    Int     @default(0)
+
+  category   MenuCategory     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  options    MenuItemOption[]
+  orderLines OrderLine[]
+
+  @@index([categoryId])
+  @@map("menu_item")
+}
+
+model MenuItemOption {
+  id              String  @id @default(cuid())
+  menuItemId      String
+  groupName       String // "Cuisson", "Supplément", ...
+  name            String // "Saignant", "Fromage", ...
+  priceCentsDelta Int     @default(0)
+  required        Boolean @default(false)
+
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+
+  @@index([menuItemId])
+  @@map("menu_item_option")
+}
+
+enum OrderType {
+  PICKUP
+  DELIVERY
+}
+
+enum OrderStatus {
+  RECEIVED
+  PREPARING
+  READY
+  PICKED_UP
+  DELIVERED
+  CANCELLED
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  organizationId  String
+  businessId      String
+  callId          String?
+  type            OrderType
+  status          OrderStatus @default(RECEIVED)
+  customerName    String
+  customerPhone   String?
+  scheduledFor    DateTime? // heure de retrait ou de livraison
+  deliveryAddress String?
+  totalCents      Int // toujours calculé serveur, jamais par le LLM
+  notes           String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  call         Call?        @relation(fields: [callId], references: [id], onDelete: SetNull)
+  lines        OrderLine[]
+
+  @@index([organizationId, createdAt])
+  @@index([businessId, status])
+  @@map("order")
+}
+
+model OrderLine {
+  id             String  @id @default(cuid())
+  orderId        String
+  menuItemId     String?
+  label          String // libellé figé au moment de la commande
+  quantity       Int     @default(1)
+  unitPriceCents Int
+  totalCents     Int
+  /// Options choisies : [{"group":"Cuisson","name":"Saignant","priceCentsDelta":0}]
+  options        Json?
+  allergyNote    String?
+
+  order    Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem? @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("order_line")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages (fallback de l'agent)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Message {
+  id             String   @id @default(cuid())
+  organizationId String
+  businessId     String
+  callId         String?
+  fromE164       String?
+  content        String // message transcrit
+  urgent         Boolean  @default(false)
+  read           Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  call         Call?        @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@map("message")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Facturation & usage
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum SubscriptionPlan {
+  STARTER // 79 € — 150 min, 1 numéro
+  PRO // 179 € — 500 min, 1 numéro, commandes + intégrations
+  BUSINESS // 349 € — 1200 min, 2 numéros, multi-établissements
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  organizationId       String             @unique
+  stripeCustomerId     String?            @unique
+  stripeSubscriptionId String?            @unique
+  plan                 SubscriptionPlan   @default(STARTER)
+  status               SubscriptionStatus @default(TRIALING)
+  includedMinutes      Int                @default(150)
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  trialEndsAt          DateTime?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@map("subscription")
+}
+
+/// Agrégat mensuel de consommation (alimenté à chaque call.ended).
+model UsageRecord {
+  id               String   @id @default(cuid())
+  organizationId   String
+  periodStart      DateTime
+  periodEnd        DateTime
+  usedSeconds      Int      @default(0)
+  overageSeconds   Int      @default(0)
+  reportedToStripe Boolean  @default(false)
+  updatedAt        DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, periodStart])
+  @@map("usage_record")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit (actions sensibles : RGPD, plans, suppressions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  actorUserId    String?
+  action         String // "gdpr.purge", "booking.delete", "plan.change", ...
+  targetType     String?
+  targetId       String?
+  data           Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  actor        User?         @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@map("audit_log")
+}

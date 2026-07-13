@@ -1,0 +1,6 @@
+node_modules
+.next
+src/generated
+prisma/migrations
+.pgdata-test
+package-lock.json
