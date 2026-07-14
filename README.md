@@ -52,6 +52,21 @@ tests/                unit + integration (dont test d'isolation multi-tenant)
 
 **Règle multi-tenant** : aucun accès Prisma direct aux tables métier depuis les pages/routes — toujours via un repository qui exige un `TenantContext`. Le test `tests/integration/tenant-isolation.test.ts` le prouve et casse la CI en cas de régression.
 
+## Mise en service de l'agent vocal (Phase 2)
+
+L'architecture voix est décrite dans [ARCHITECTURE.md](./ARCHITECTURE.md) §2 : Vapi (Deepgram fr + Claude Haiku 4.5 + voix Azure fr) derrière l'interface `VoiceProvider`, décisions prises exclusivement par nos tools serveur.
+
+1. **Clés** : renseigner `VAPI_API_KEY`, `VAPI_WEBHOOK_SECRET` (chaîne aléatoire ≥ 16 car., le webhook la vérifie), `ANTHROPIC_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` — en local **et** dans Railway. `BETTER_AUTH_URL` doit être l'URL publique (les webhooks Vapi pointent dessus).
+2. **Numéro français** : dans la console Twilio, créer un _Regulatory Bundle_ FR (justificatif d'adresse) puis acheter un numéro +33 — étape réglementaire non automatisable proprement.
+3. **Provisionner** :
+   ```bash
+   npx tsx scripts/provision-number.ts --business <businessId> --number <+33XXXXXXXXX>
+   ```
+   Le script synchronise l'assistant chez Vapi (prompt versionné `prompts/system-v1.ts` + config du commerce), importe le numéro et active l'agent.
+4. **Tester** : appeler le numéro — réservation de bout en bout, SMS de confirmation, appel visible dans le dashboard avec transcription, résumé (Claude Opus 4.8) et coûts.
+
+Webhooks entrants : `POST /api/webhooks/voice`, authentifiés par l'en-tête `x-vapi-secret`. Événements : `status-update` (création de l'appel), `tool-calls` (chemin critique de latence — SMS et notifications sont différés via `after()`), `end-of-call-report` (durée, coûts €, transcription, décompte minutes, analyse post-appel).
+
 ## Déploiement (Railway, région EU)
 
 1. Créer un projet Railway (région **Amsterdam**) + un service PostgreSQL.
